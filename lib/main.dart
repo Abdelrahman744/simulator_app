@@ -18,13 +18,20 @@ const serverUrl = String.fromEnvironment(
 );
 
 // ── Tuning constants ────────────────────────────────────────────────────────
-const requestTimeout  = Duration(seconds: 5);
-const slowThreshold   = Duration(seconds: 3); // "Still working..." timer
-const maxAttempts     = 3;
-const modeSetTimeout  = Duration(seconds: 3); // POST /mode has no retry
+const requestTimeout = Duration(seconds: 5);
+const slowThreshold = Duration(seconds: 3); // "Still working..." timer
+const maxAttempts = 3;
+const modeSetTimeout = Duration(seconds: 3); // POST /mode has no retry
 
 // ── Failure taxonomy ────────────────────────────────────────────────────────
-enum FailureKind { offline, timeout, noServer, serverError, rejected, unauthorized }
+enum FailureKind {
+  offline,
+  timeout,
+  noServer,
+  serverError,
+  rejected,
+  unauthorized,
+}
 
 String describe(FailureKind kind) {
   switch (kind) {
@@ -45,6 +52,56 @@ String describe(FailureKind kind) {
 
 // ── Mode metadata ────────────────────────────────────────────────────────────
 const serverModes = ['normal', 'slow', 'flaky', 'hangs'];
+
+class _LoadResult {
+  const _LoadResult.success(this.data) : failure = null, shouldRetry = false;
+
+  const _LoadResult.failure(this.failure, {required this.shouldRetry})
+    : data = null;
+
+  final Map<String, dynamic>? data;
+  final FailureKind? failure;
+  final bool shouldRetry;
+}
+
+_LoadResult _classifyResponse(http.Response response) {
+  if (response.statusCode == 200) {
+    try {
+      final body = jsonDecode(response.body);
+      if (body is Map<String, dynamic>) {
+        return _LoadResult.success(body);
+      }
+    } catch (_) {}
+    return const _LoadResult.failure(
+      FailureKind.serverError,
+      shouldRetry: true,
+    );
+  }
+
+  if (response.statusCode == 401) {
+    return const _LoadResult.failure(
+      FailureKind.unauthorized,
+      shouldRetry: false,
+    );
+  }
+  if (response.statusCode == 429) {
+    return const _LoadResult.failure(
+      FailureKind.serverError,
+      shouldRetry: true,
+    );
+  }
+  if (response.statusCode >= 400 && response.statusCode < 500) {
+    return const _LoadResult.failure(FailureKind.rejected, shouldRetry: false);
+  }
+  if (response.statusCode >= 500 && response.statusCode <= 599) {
+    const retryableStatusCodes = {500, 502, 503, 504};
+    return _LoadResult.failure(
+      FailureKind.serverError,
+      shouldRetry: retryableStatusCodes.contains(response.statusCode),
+    );
+  }
+  return const _LoadResult.failure(FailureKind.serverError, shouldRetry: true);
+}
 
 void main() => runApp(const ResilientApp());
 
@@ -74,11 +131,11 @@ class _HomePageState extends State<HomePage> {
   String _selectedMode = 'normal';
 
   // ── load state
-  bool          _loading        = false;
-  bool          _cancelled      = false;
-  String        _status         = '';   // status line under the spinner
-  FailureKind?  _lastFailure;           // null = no error
-  Map<String, dynamic>? _data;          // last successful payload
+  bool _loading = false;
+  bool _cancelled = false;
+  String _status = ''; // status line under the spinner
+  FailureKind? _lastFailure; // null = no error
+  Map<String, dynamic>? _data; // last successful payload
 
   // "earlier data" note shown when a refresh fails but we still have old data
   bool _showingEarlierData = false;
@@ -87,15 +144,15 @@ class _HomePageState extends State<HomePage> {
   bool _retryWhenOnline = false;
 
   // ── timers / subscriptions / active client
-  Timer?                      _slowTimer;
+  Timer? _slowTimer;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
-  http.Client?                _activeClient;
+  http.Client? _activeClient;
 
   // ── cleanup ─────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    _fetchCurrentMode();   // best-effort — sync dropdown at startup
+    _fetchCurrentMode(); // best-effort — sync dropdown at startup
     _listenConnectivity(); // watch for network changes
   }
 
@@ -160,7 +217,9 @@ class _HomePageState extends State<HomePage> {
     } on Exception {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Couldn't reach the server to change mode.")),
+          const SnackBar(
+            content: Text("Couldn't reach the server to change mode."),
+          ),
         );
       }
     } finally {
@@ -173,10 +232,10 @@ class _HomePageState extends State<HomePage> {
     if (_loading) return; // ignore duplicate taps
 
     setState(() {
-      _loading        = true;
-      _cancelled      = false;
-      _lastFailure    = null;
-      _status         = 'Loading...';
+      _loading = true;
+      _cancelled = false;
+      _lastFailure = null;
+      _status = 'Loading...';
       _showingEarlierData = false;
     });
 
@@ -190,116 +249,98 @@ class _HomePageState extends State<HomePage> {
     // ── Retry loop ─────────────────────────────────────────────────────────
     // Only safe, idempotent GET is retried (a POST that creates data would not be — see spec).
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-      // 1. Connectivity check
       if (await _isOffline()) {
         _retryWhenOnline = true;
         lastError = FailureKind.offline;
-        break; // stop — listener will auto-retry when online
+        break;
       }
 
       if (_cancelled) break;
 
-      // 2. Issue request with 5 s timeout; create a fresh client each attempt
-      //    so closing it really aborts the socket (spec §4.2 requirement).
-      _activeClient = http.Client();
-      int? statusCode;
-      bool shouldRetry = false;
-      try {
-        final res = await _activeClient!
-            .get(Uri.parse('$serverUrl/data'))
-            .timeout(requestTimeout);
-        statusCode = res.statusCode;
-
-        if (statusCode == 200) {
-          // Success
-          final body = jsonDecode(res.body) as Map<String, dynamic>;
-          if (mounted && !_cancelled) {
-            setState(() {
-              _data            = body;
-              _loading         = false;
-              _status          = '';
-              _lastFailure     = null;
-              _showingEarlierData = false;
-            });
-          }
-          _cleanupAfterLoad();
-          return; // done
+      final result = await _requestData();
+      if (result.data != null) {
+        if (mounted && !_cancelled) {
+          setState(() {
+            _data = result.data;
+            _loading = false;
+            _status = '';
+            _lastFailure = null;
+            _showingEarlierData = false;
+          });
         }
-
-        // ── Classify HTTP error
-        if (statusCode == 429) {
-          // Rate-limited: honour Retry-After header if present
-          lastError   = FailureKind.serverError;
-          shouldRetry = true;
-        } else if (statusCode == 401) {
-          lastError   = FailureKind.unauthorized;
-          shouldRetry = false; // non-retryable
-        } else if (statusCode >= 500 && statusCode <= 599) {
-          // 500/502/503/504 → retryable; other 5xx → not retryable
-          final retryable5xx = {500, 502, 503, 504};
-          lastError   = FailureKind.serverError;
-          shouldRetry = retryable5xx.contains(statusCode);
-        } else if (statusCode >= 400) {
-          lastError   = FailureKind.rejected;
-          shouldRetry = false; // 4xx generally not retryable
-        } else {
-          lastError   = FailureKind.serverError;
-          shouldRetry = true;
-        }
-      } on TimeoutException {
-        lastError   = FailureKind.timeout;
-        shouldRetry = true;
-      } on SocketException {
-        lastError   = FailureKind.noServer;
-        shouldRetry = true;
-      } on http.ClientException {
-        lastError   = FailureKind.noServer;
-        shouldRetry = true;
-      } catch (_) {
-        lastError   = FailureKind.serverError;
-        shouldRetry = true;
-      } finally {
-        _activeClient?.close();
-        _activeClient = null; // always close to free the socket
+        _cleanupAfterLoad();
+        return;
       }
 
+      lastError = result.failure;
       if (_cancelled) break;
-      if (!shouldRetry) break; // non-retryable error — stop immediately
+      if (!result.shouldRetry) break;
 
-      // 3. Backoff between attempts (not after the last attempt)
       if (attempt < maxAttempts) {
-        // Backoff: 1 s, 2 s  (2^(attempt-1) seconds: attempt 1 → 1 s, attempt 2 → 2 s)
-        final waitSeconds = 1 << (attempt - 1); // bit-shift = 2^(attempt-1)
-        final nextAttempt = attempt + 1;
-        for (int t = waitSeconds; t > 0; t--) {
-          if (_cancelled) break;
-          if (mounted) {
-            setState(() {
-              _status = 'Retrying in ${t}s (attempt $nextAttempt of $maxAttempts)...';
-            });
-          }
-          await Future.delayed(const Duration(seconds: 1));
-        }
+        await _waitBeforeRetry(attempt);
       }
-    } // end retry loop
+    }
 
-    // ── Loop ended: show error (unless cancelled)
     if (!_cancelled && mounted) {
       final hasOldData = _data != null;
       setState(() {
-        _loading            = false;
-        _status             = '';
-        _lastFailure        = lastError;
+        _loading = false;
+        _status = '';
+        _lastFailure = lastError;
         _showingEarlierData = hasOldData;
       });
     } else if (_cancelled && mounted) {
       setState(() {
-        _loading     = false;
-        _status      = 'Cancelled.';
+        _loading = false;
+        _status = 'Cancelled.';
         _lastFailure = null;
       });
     }
     _cleanupAfterLoad();
+  }
+
+  Future<_LoadResult> _requestData() async {
+    final client = http.Client();
+    _activeClient = client;
+
+    try {
+      final response = await client
+          .get(Uri.parse('$serverUrl/data'))
+          .timeout(requestTimeout);
+      return _classifyResponse(response);
+    } on TimeoutException {
+      return const _LoadResult.failure(FailureKind.timeout, shouldRetry: true);
+    } on SocketException {
+      return const _LoadResult.failure(FailureKind.noServer, shouldRetry: true);
+    } on http.ClientException {
+      return const _LoadResult.failure(FailureKind.noServer, shouldRetry: true);
+    } catch (_) {
+      return const _LoadResult.failure(
+        FailureKind.serverError,
+        shouldRetry: true,
+      );
+    } finally {
+      client.close();
+      if (identical(_activeClient, client)) {
+        _activeClient = null;
+      }
+    }
+  }
+
+  Future<void> _waitBeforeRetry(int attempt) async {
+    final waitSeconds = 1 << (attempt - 1);
+    final nextAttempt = attempt + 1;
+
+    for (int secondsLeft = waitSeconds; secondsLeft > 0; secondsLeft--) {
+      if (_cancelled) return;
+      if (mounted) {
+        setState(() {
+          _status =
+              'Retrying in ${secondsLeft}s (attempt $nextAttempt of $maxAttempts)...';
+        });
+      }
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
   }
 
   void _cleanupAfterLoad() {
@@ -340,23 +381,21 @@ class _HomePageState extends State<HomePage> {
               onChanged: _loading ? null : _setMode, // lock while loading
             ),
             const SizedBox(height: 16),
-            _LoadButton(
-              loading: _loading,
-              onLoad: _load,
-              onCancel: _cancel,
-            ),
+            _LoadButton(loading: _loading, onLoad: _load, onCancel: _cancel),
             if (_status.isNotEmpty) ...[
               const SizedBox(height: 12),
               _StatusLine(status: _status, loading: _loading),
             ],
             const SizedBox(height: 16),
-            Expanded(child: _Body(
-              loading:            _loading,
-              failure:            _lastFailure,
-              data:               _data,
-              showingEarlierData: _showingEarlierData,
-              onRetry:            _load,
-            )),
+            Expanded(
+              child: _Body(
+                loading: _loading,
+                failure: _lastFailure,
+                data: _data,
+                showingEarlierData: _showingEarlierData,
+                onRetry: _load,
+              ),
+            ),
           ],
         ),
       ),
@@ -376,16 +415,21 @@ class _ModeSelector extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        const Text('Server mode:', style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text(
+          'Server mode:',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
         const SizedBox(width: 12),
         DropdownButton<String>(
           value: selected,
           onChanged: onChanged == null ? null : (v) => onChanged!(v!),
           items: serverModes
-              .map((m) => DropdownMenuItem(
-                    value: m,
-                    child: Text(m[0].toUpperCase() + m.substring(1)),
-                  ))
+              .map(
+                (m) => DropdownMenuItem(
+                  value: m,
+                  child: Text(m[0].toUpperCase() + m.substring(1)),
+                ),
+              )
               .toList(),
         ),
       ],
@@ -414,10 +458,7 @@ class _LoadButton extends StatelessWidget {
         ),
         if (loading) ...[
           const SizedBox(width: 12),
-          OutlinedButton(
-            onPressed: onCancel,
-            child: const Text('Cancel'),
-          ),
+          OutlinedButton(onPressed: onCancel, child: const Text('Cancel')),
         ],
       ],
     );
@@ -444,9 +485,8 @@ class _StatusLine extends StatelessWidget {
         Expanded(
           child: Text(
             status,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: Theme.of(context).colorScheme.secondary,
-            ),
+            style: Theme.of(context).textTheme.bodyMedium
+                ?.copyWith(color: Theme.of(context).colorScheme.secondary),
           ),
         ),
       ],
